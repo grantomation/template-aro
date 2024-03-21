@@ -1,0 +1,352 @@
+name: ARO Public Deployment
+on: [workflow_dispatch]
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs: 
+  vault_and_cloud_identity:
+    runs-on: ubuntu-latest
+    outputs:
+      identityClientId: ${{ steps.identity.outputs.identityClientId }}
+      identityObjectId: ${{ steps.identity.outputs.identityObjectId }}
+      identityName: ${{ steps.identity.outputs.identityName }}
+      keyVaultUri: ${{ steps.keyvault.outputs.keyVaultUri }}
+      keyVaultName: ${{ steps.keyvault.outputs.keyVaultName }}
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+    - name: create identity
+      uses: azure/arm-deploy@v2
+      id: identity
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+        resourceGroupName: ${{ vars.RESOURCEGROUP }}
+        template: ./modules/managed-identity.bicep
+        parameters: >
+          ./action_params/managed-identity.parameters.json
+          location="${{ vars.LOCATION }}"
+        deploymentName: identity-github-actions
+
+    - name: create Keyvault
+      uses: azure/arm-deploy@v2
+      id: keyvault
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+        resourceGroupName: ${{ vars.RESOURCEGROUP }}
+        template: ./modules/keyvault.bicep
+        parameters: >
+          ./action_params/keyvault.parameters.json
+          location="${{ vars.LOCATION }}"
+          identityObjectId=${{ steps.identity.outputs.identityObjectId }}
+          spObjectId=${{ secrets.AAD_SP_OBJECT_ID }}
+        deploymentName: keyvault-github-actions
+  
+  deploy_storage:
+    runs-on: ubuntu-latest
+    needs: [vault_and_cloud_identity]
+    outputs:
+      storageAccountName: ${{ steps.deploy_storage.outputs.storageAccountName }}
+      blobContainerName: ${{ steps.deploy_storage.outputs.blobContainerName }}
+      blobEndpoint: ${{ steps.deploy_storage.outputs.blobEndpoint }}
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      - name: azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+      - name: Deploy storage
+        uses: azure/arm-deploy@v2
+        id: deploy_storage
+        with:
+          scope: resourcegroup
+          subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+          resourceGroupName: ${{ vars.RESOURCEGROUP }}
+          template: ./modules/storage.bicep
+          parameters: >
+              ./action_params/storage.parameters.json
+              location=${{ vars.LOCATION }}
+              aadObjectId=${{ secrets.AAD_SP_OBJECT_ID }}
+              identityObjectId="${{ needs.vault_and_cloud_identity.outputs.identityObjectId }}"
+          deploymentName: storage-github-actions
+
+  aro_networking:
+    runs-on: ubuntu-latest
+    outputs:
+      vnetName: ${{ steps.network.outputs.vnetName }}
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+  
+    - name: ARO networking
+      id: network
+      uses: azure/arm-deploy@v2
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+        resourceGroupName: ${{ vars.RESOURCEGROUP }}
+        template: ./modules/aro_public_network.bicep
+        parameters: >
+          ./action_params/aro_public_networking.parameters.json
+          location="${{ vars.LOCATION }}"
+        deploymentName: aro-public-networking-github-actions
+
+  deploy_aro: 
+    needs: [aro_networking, build_and_push]
+    outputs:
+      clusterName: ${{ steps.aro.outputs.clusterName }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+    - name: Get latest version of ARO
+      run: | 
+        ARO_LATEST=$(az aro get-versions -l ${{ vars.LOCATION }} -o tsv | sort -nr | head -n 1)
+        echo "ARO_LATEST=${ARO_LATEST}" >> $GITHUB_ENV
+      shell: bash
+      
+    - name: aro_cluster
+      uses: azure/arm-deploy@v2
+      id: aro
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+        resourceGroupName: ${{ vars.RESOURCEGROUP }}
+        template: ./modules/aro_cluster.bicep
+        parameters: >
+          ./action_params/aro_public.parameters.json 
+          openshiftVersion="${{ env.ARO_LATEST }}"
+          pullSecret="${{ secrets.PULL_SECRET }}"
+          location="${{ vars.LOCATION }}"
+          aadClientId="${{ secrets.AAD_APP_CLIENT_ID }}"
+          aadClientSecret="${{ secrets.AAD_CLIENT_SECRET }}"
+          rpObjectId="${{ secrets.ARO_RP_OB_ID }}"
+          vnetName="${{ needs.aro_networking.outputs.vnetName }}"
+        deploymentName: aro-public-github-actions
+
+  deploy_registry:
+    runs-on: ubuntu-latest
+    needs: [vault_and_cloud_identity]
+    outputs:
+      acrName: ${{ steps.acr.outputs.acrName }}
+      loginServer: ${{ steps.acr.outputs.loginServer }}
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+
+    - name: deploy_registry
+      uses: azure/arm-deploy@v2
+      id: acr
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+        resourceGroupName: ${{ vars.RESOURCEGROUP }}
+        template: ./modules/acr.bicep
+        parameters: > 
+          ./action_params/acr.parameters.json
+          location="${{ vars.LOCATION }}" 
+          principalId="${{ needs.vault_and_cloud_identity.outputs.identityObjectId }}"
+        deploymentName: acr-github-actions
+
+  build_and_push:
+    runs-on: ubuntu-latest
+    needs: [vault_and_cloud_identity, deploy_registry]
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+
+    - name: Get ACR token and software versions
+      run: |      
+          ACR_TOKEN="$(az acr login --name ${{ needs.deploy_registry.outputs.acrName }} --expose-token --query accessToken -o tsv)"
+          echo "ACR_TOKEN=${ACR_TOKEN}" >> $GITHUB_ENV
+
+          HELM_VERSION="$(curl -s "https://api.github.com/repos/helm/helm/releases/latest" | jq -r .tag_name | sed 's/^v//')"
+          echo "HELM_VERSION=${HELM_VERSION}" >> $GITHUB_ENV
+
+          GITHUB_RUNNER_VERSION="$(curl -s "https://api.github.com/repos/actions/runner/releases/latest" | jq -r .tag_name | sed 's/^v//')"
+          echo "GITHUB_RUNNER_VERSION=${GITHUB_RUNNER_VERSION}" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Login to ACR
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ needs.deploy_registry.outputs.loginServer }}
+        username: ${{ vars.ACR_USERNAME }}
+        password: ${{ env.ACR_TOKEN }}
+
+    - name: build and push container
+      run: | 
+        docker build . -f ./config_runner_container/Dockerfile -t ${{ needs.deploy_registry.outputs.loginServer }}/${{ vars.CONTAINER_BUILD_NAME }} --build-arg HELM_VERSION=${{ env.HELM_VERSION }} --build-arg GITHUB_RUNNER_VERSION=${{ env.GITHUB_RUNNER_VERSION }}
+        docker push ${{ needs.deploy_registry.outputs.loginServer }}/${{ vars.CONTAINER_BUILD_NAME }}
+
+  write_secrets:
+    needs: [vault_and_cloud_identity, deploy_aro, deploy_storage, build_and_push]
+    runs-on: ubuntu-latest
+    outputs:
+      tarName: ${{ steps.write.outputs.tarName }}
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+    
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+    #TODO - put storage account details here for configuration
+    - name: Get ARO cluster details and write secrets to keyvault
+      id: write
+      run: |
+          ARO_API="$(az aro show -n ${{ needs.deploy_aro.outputs.clusterName }} -g ${{ vars.RESOURCEGROUP}} --query apiserverProfile.url -o tsv)"
+          echo "ARO_API=${ARO_API}" >> $GITHUB_ENV
+          az keyvault secret set --name aroApiServer --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${ARO_API}
+          ARO_PWD="$(az aro list-credentials -n ${{ needs.deploy_aro.outputs.clusterName }} -g ${{ vars.RESOURCEGROUP }} --query kubeadminPassword -o tsv)"
+          echo "ARO_PWD=${ARO_PWD}" >> $GITHUB_ENV
+          az keyvault secret set --name aroKubeAdminPassword --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${ARO_PWD}
+          az keyvault secret set --name azureSubscription --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${{ vars.AZURE_SUBSCRIPTION }}
+          az keyvault secret set --name location --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${{ vars.LOCATION }}
+          az keyvault secret set --name aadClientId --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${{ secrets.AAD_APP_CLIENT_ID }}
+          az keyvault secret set --name aadClientSecret --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${{ secrets.AAD_CLIENT_SECRET }}
+          az keyvault secret set --name tenantId --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${{ secrets.TENANT_ID }}
+          az keyvault secret set --name aadAdminGroupId --vault-name ${{ needs.vault_and_cloud_identity.outputs.keyVaultName }} --value ${{ secrets.AAD_ADMIN_GROUP_ID }}      
+
+          # Upload configuration files to storage account
+          OPENSHIFT_CONFIG_TAR_NAME="openshift_config.tar.gz"
+                        
+          tar -czvf ${OPENSHIFT_CONFIG_TAR_NAME} ./openshift_configuration/*
+
+          az storage blob upload -f ${OPENSHIFT_CONFIG_TAR_NAME} --account-name ${{ needs.deploy_storage.outputs.storageAccountName }} --auth-mode login -c ${{ needs.deploy_storage.outputs.blobContainerName }} -n ${OPENSHIFT_CONFIG_TAR_NAME}
+          echo "tarName=${OPENSHIFT_CONFIG_TAR_NAME}" >> $GITHUB_OUTPUT
+      shell: bash
+
+  deploy_aci_aro:
+      runs-on: ubuntu-latest
+      needs:  [vault_and_cloud_identity, aro_networking, write_secrets, deploy_aro, deploy_registry, build_and_push]
+      outputs:
+        aciAroName: ${{ steps.aci_aro.outputs.containerName }}
+      steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      - name: azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+      - name: deploy_aci_aro
+        uses: azure/arm-deploy@v2
+        id: aci_aro
+        with:
+          scope: resourcegroup
+          subscriptionId: ${{ vars.AZURE_SUBSCRIPTION }}
+          resourceGroupName: ${{ vars.RESOURCEGROUP }}
+          template: ./modules/aci.bicep
+          parameters: > 
+            ./action_params/aci_aro.parameters.json
+            location="${{ vars.LOCATION }}"
+            loginServer="${{ needs.deploy_registry.outputs.loginServer  }}"
+            containerBuildName="${{ vars.CONTAINER_BUILD_NAME }}"
+            identityName="${{ needs.vault_and_cloud_identity.outputs.identityName }}"
+            ghRepository=${{ vars.GH_REPOSITORY }}
+            ghPersonalToken=${{ secrets.PAT_GITHUB }}
+            keyVaultUri="${{ needs.vault_and_cloud_identity.outputs.keyVaultUri}}"
+          deploymentName: aci-kv-github-actions 
+
+  aro_day_2_config:
+    runs-on: self-hosted
+    needs: [vault_and_cloud_identity, aro_networking, write_secrets, deploy_aro, deploy_registry, build_and_push, deploy_aci_aro, deploy_storage]
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v4
+
+    - name: azure login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AAD_APP_CLIENT_ID }}
+        tenant-id: ${{ secrets.TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION }}
+
+    - name: Configure ARO cluster
+      run: | 
+        VAULT_TOKEN=$(curl 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -H Metadata:true | jq -r '.access_token')
+        ARO_API=$(curl $KV_URI/secrets/aroApiServer/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+        ARO_KUBEADMIN_PWD=$(curl $KV_URI/secrets/aroKubeAdminPassword/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"' )
+        AZURE_SUBSCRIPTION=$(curl $KV_URI/secrets/azureSubscription/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+        LOCATION=$(curl $KV_URI/secrets/location/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+        AAD_APP_CLIENT_ID=$(curl $KV_URI/secrets/aadClientId/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+        AAD_CLIENT_SECRET=$(curl $KV_URI/secrets/aadClientSecret/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+        TENANT_ID=$(curl $KV_URI/secrets/tenantId/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+        GROUP_ID=$(curl $KV_URI/secrets/aadAdminGroupId/?api-version=2016-10-01 -H "Authorization: Bearer $VAULT_TOKEN" | jq .value | tr -d '"')
+
+        # CONFIGURE OPENSHIFT AS KUBEADMIN
+        oc login -u kubeadmin -p $ARO_KUBEADMIN_PWD $ARO_API --insecure-skip-tls-verify
+
+        # Download the yaml files from secure storage        
+        STORAGE_TOKEN=$(curl 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F' -H Metadata:true | jq -r '.access_token')
+        curl -OJ ${{ needs.deploy_storage.outputs.blobEndpoint}}${{ needs.deploy_storage.outputs.blobContainerName}}/${{ needs.write_secrets.outputs.tarName }} -H "x-ms-version: 2017-11-09" -H "Authorization: Bearer $STORAGE_TOKEN"          
+        tar -xvf ${{ needs.write_secrets.outputs.tarName }}
+
+        # Configure Active Directory (service principal has already been setup)
+        B64=$(echo -n $AAD_CLIENT_SECRET | base64)
+        oc process -f openshift_configuration/aad.yaml -p TENANT_ID=$TENANT_ID -p IDP_NAME=${{ vars.IDP_NAME }} -p AAD_APP_CLIENT_ID=$AAD_APP_CLIENT_ID -p AAD_CLIENT_SECRET=$B64 -p AAD_GROUP_ID=$GROUP_ID | oc apply -f - --namespace=openshift-config
+
+        # Install web terminal operator
+        oc create -f openshift_configuration/web_terminal_operator.yaml
+
+        # Install sample web service from template
+        oc new-project sample-web-app
+        oc process httpd-example -n openshift | oc create -f - -n sample-web-app
+        oc patch route httpd-example -n sample-web-app --type=merge -p '{"spec":{"to":{"kind":"Service","name":"httpd-example"},"tls":{"termination":"edge"}}}'
+
+      shell: bash
